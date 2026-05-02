@@ -336,9 +336,10 @@ class AlignmentEngine:
     ) -> List[Dict]:
         """Runs Whisper on a single ≤30s segment. Returns raw word list."""
         inputs = self.whisper_processor(
-            speech, sampling_rate=16000, return_tensors="pt"
+            speech, sampling_rate=16000, return_tensors="pt", return_attention_mask=True
         )
         input_features = inputs.input_features.to(self.device)
+        attention_mask = inputs.attention_mask.to(self.device) if "attention_mask" in inputs else None
 
         # Ensure alignment_heads are set (needed for token timestamps)
         if (not hasattr(self.whisper_model.generation_config, 'alignment_heads')
@@ -353,7 +354,8 @@ class AlignmentEngine:
                 "return_token_timestamps":  True,
                 "return_dict_in_generate":  True,
             }
-
+            if attention_mask is not None:
+                generate_kwargs["attention_mask"] = attention_mask
 
             result = self.whisper_model.generate(input_features, **generate_kwargs)
         except Exception as e:
