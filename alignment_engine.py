@@ -8,6 +8,7 @@ from typing import List, Dict
 import gc
 import librosa
 from rapidfuzz import fuzz
+import re
 
 
 class AlignmentEngine:
@@ -134,6 +135,7 @@ class AlignmentEngine:
         emission = emissions[0].detach()
 
         # ── Tokenise reference text ───────────────────────────────────────────
+        reference_text = self._normalize_arabic(reference_text)
         words = reference_text.split()
         vocab = self.wav2vec2_processor.tokenizer.get_vocab()
         special_ids = [
@@ -469,6 +471,7 @@ class AlignmentEngine:
         overlap_sec = 30.0      # 30 seconds overlap
         step_sec = chunk_sec - overlap_sec
 
+        reference_text = self._normalize_arabic(reference_text)
         ref_words = reference_text.split()
         total_words = len(ref_words)
         words_per_sec = total_words / duration
@@ -560,6 +563,12 @@ class AlignmentEngine:
         return final_alignments
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
+
+    def _normalize_arabic(self, text: str) -> str:
+        """Removes Arabic diacritics and Uthmani symbols to improve CTC alignment."""
+        # Matches basic tashkeel, small high letters, and Quranic annotation signs
+        pattern = re.compile(r'[\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]')
+        return pattern.sub('', text)
 
     def _map_to_reference(
         self,
