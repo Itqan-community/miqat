@@ -178,85 +178,86 @@ class AlignmentEngine:
 
     def align_hybrid(self, audio_path: str, reference_text: str) -> List[Dict]:
         """
-        Hybrid Pro v2: Anchor-to-Anchor segmented CTC refinement.
+        Hybrid Pro v3 (Fusion-Pro): WhisperX Backbone + CTC Micro-Refinement.
         """
-        print("[Hybrid-Pro] Starting alignment v2...")
+        print("[Hybrid-Pro] Starting Fusion-Pro v3...")
         
-        # 1. WhisperX Global Pass
+        # 1. WhisperX Base Pass (The reliable sequence)
         w_alignments = self.align_whisperx(audio_path, reference_text)
         
-        # 2. Anchor Identification
-        # An anchor is a word with very high confidence.
-        anchors = []
-        for i, entry in enumerate(w_alignments):
-            if entry["confidence"] > 0.92: # More strict for v2
-                anchors.append(i)
+        # 2. CTC Base Pass (The precise candidate)
+        # We run CTC on the whole audio to get a full candidate set
+        c_alignments = self.align(audio_path, reference_text)
         
-        if not anchors:
-            print("[Hybrid-Pro] No strong anchors found, falling back to WhisperX.")
-            return w_alignments
-
-        # 3. Local CTC Refinement
-        speech, sr = sf.read(audio_path, dtype='float32')
-        if len(speech.shape) > 1: speech = speech.mean(axis=1)
-        duration_total = len(speech) / sr
+        # 3. Intelligent Fusion
+        final_alignments = []
         
-        refined_alignments = []
-        last_anchor_idx = -1
-        last_anchor_end_time = 0.0
+        # Create a searchable map of CTC results by word text
+        # (Using a sliding window or index search because words repeat)
+        c_idx = 0
         
-        # Reference words
-        ref_words = [w["word"] for w in w_alignments]
-
-        # Add a virtual end anchor
-        anchor_indices = anchors + [len(w_alignments)]
-
-        for current_anchor_idx in anchor_indices:
-            gap_start_idx = last_anchor_idx + 1
-            gap_end_idx = current_anchor_idx
+        for w_entry in w_alignments:
+            word_text = self._normalize_arabic(w_entry["word"])
+            best_ctc = None
+            min_dist = 0.6 # Max allowed distance to trust CTC (seconds)
             
-            # Determine window end time
-            if current_anchor_idx < len(w_alignments):
-                current_anchor_start_time = w_alignments[current_anchor_idx]["start"]
+            # Look for a matching word in CTC results within a time window
+            # Search nearby indices in c_alignments to handle repetitions correctly
+            search_start = max(0, c_idx - 5)
+            search_end = min(len(c_alignments), c_idx + 10)
+            
+            for i in range(search_start, search_end):
+                c_entry = c_alignments[i]
+                c_text = self._normalize_arabic(c_entry["word"])
+                
+                if word_text == c_text:
+                    # Check temporal distance between centers
+                    dist = abs(((w_entry["start"] + w_entry["end"])/2) - ((c_entry["start"] + c_entry["end"])/2))
+                    if dist < min_dist:
+                        best_ctc = c_entry
+                        min_dist = dist
+                        c_idx = i + 1 # Move CTC pointer forward
+                        break
+            
+            if best_ctc and best_ctc["confidence"] > 0.4:
+                # Use CTC for precision, but clamp to a reasonable window around WhisperX
+                # to prevent radical jumps
+                refined_start = best_ctc["start"]
+                refined_end = best_ctc["end"]
+                
+                # Boundary check: don't drift more than 0.5s from WhisperX
+                if abs(refined_start - w_entry["start"]) > 0.5:
+                    refined_start = w_entry["start"]
+                if abs(refined_end - w_entry["end"]) > 0.5:
+                    refined_end = w_entry["end"]
+
+                final_alignments.append({
+                    "word": w_entry["word"],
+                    "start": round(refined_start, 3),
+                    "end": round(refined_end, 3),
+                    "confidence": max(w_entry["confidence"], best_ctc["confidence"])
+                })
             else:
-                current_anchor_start_time = duration_total
+                # Fallback to WhisperX backbone (Robust)
+                final_alignments.append(w_entry)
 
-            if gap_start_idx < gap_end_idx:
-                # We have words between anchors (or before the first anchor)
-                # WINDOW: From the end of the last anchor to the start of the current anchor
-                t_start = max(0, last_anchor_end_time - 0.3)
-                t_end = min(duration_total, current_anchor_start_time + 0.3)
-                
-                start_sample = int(t_start * sr)
-                end_sample = int(t_end * sr)
-                sub_audio = speech[start_sample:end_sample]
-                sub_words = ref_words[gap_start_idx:gap_end_idx]
-                
-                print(f"[Hybrid-Pro] Refining gap {gap_start_idx}-{gap_end_idx-1} in window [{t_start:.2f}s, {t_end:.2f}s]")
-                
-                ctc_results = self.align_ctc(sub_audio, sr, sub_words, offset=t_start)
-                
-                if len(ctc_results) == len(sub_words):
-                    refined_alignments.extend(ctc_results)
+        # Final pass: Sanitize timestamps (non-decreasing)
+        for i in range(1, len(final_alignments)):
+            # Ensure no negative duration and no overlap
+            if final_alignments[i]["start"] < final_alignments[i-1]["end"]:
+                # If they overlap, find a middle ground or nudge
+                overlap = final_alignments[i-1]["end"] - final_alignments[i]["start"]
+                if overlap < 0.2:
+                    final_alignments[i]["start"] = final_alignments[i-1]["end"]
                 else:
-                    print(f"[Hybrid-Pro] CTC failed for gap {gap_start_idx}, fallback to WhisperX.")
-                    refined_alignments.extend(w_alignments[gap_start_idx:gap_end_idx])
+                    # Significant overlap, keep WhisperX's original start if possible
+                    pass 
             
-            # Add the anchor word itself
-            if current_anchor_idx < len(w_alignments):
-                anchor_word = w_alignments[current_anchor_idx]
-                refined_alignments.append(anchor_word)
-                last_anchor_end_time = anchor_word["end"]
-                last_anchor_idx = current_anchor_idx
+            if final_alignments[i]["end"] <= final_alignments[i]["start"]:
+                final_alignments[i]["end"] = final_alignments[i]["start"] + 0.1
 
-        # Final cleanup: ensure timestamps are non-decreasing
-        for i in range(1, len(refined_alignments)):
-            if refined_alignments[i]["start"] < refined_alignments[i-1]["end"]:
-                refined_alignments[i]["start"] = refined_alignments[i-1]["end"]
-            if refined_alignments[i]["end"] < refined_alignments[i]["start"]:
-                refined_alignments[i]["end"] = refined_alignments[i]["start"] + 0.1
-
-        return refined_alignments
+        print(f"[Hybrid-Pro] Fusion complete. Refined {len([a for a in final_alignments if a.get('refined', False)])} words.")
+        return final_alignments
 
     def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
         return self.align(audio_path, reference_text)
