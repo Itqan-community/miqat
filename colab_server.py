@@ -56,7 +56,9 @@ def _run_job(job_id: str, file_path: str, reference_text: str, method: str):
 
         print(f"[Job {job_id[:8]}] method={method}, duration={duration:.1f}s")
 
-        if method == "whisperx":
+        if method == "hybrid":
+            alignments = alignment_engine.align_hybrid(file_path, reference_text)
+        elif method == "whisperx":
             alignments = alignment_engine.align_whisperx(file_path, reference_text)
         elif method == "whisper":
             alignments = alignment_engine.align_whisper(file_path, reference_text)

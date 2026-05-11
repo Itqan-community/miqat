@@ -116,18 +116,19 @@ class AlignmentEngine:
 
     # ─── CTC Segmentation (Previous) ──────────────────────────────────────────
 
-    def align(self, audio_path: str, reference_text: str) -> List[Dict]:
+    def align_ctc(self, audio_data: np.ndarray, sr: int, words: List[str], offset: float = 0.0) -> List[Dict]:
+        """
+        Internal CTC alignment for a given audio numpy array and word list.
+        """
         if not self.wav2vec2_model:
             self.load_models()
 
-        speech, sr = sf.read(audio_path, dtype='float32')
-        if len(speech.shape) > 1: speech = speech.mean(axis=1)
         if sr != 16000:
-            speech = librosa.resample(speech, orig_sr=sr, target_sr=16000)
+            audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
             sr = 16000
 
-        duration = len(speech) / sr
-        audio_tensor = torch.from_numpy(speech).to(self.device)
+        duration = len(audio_data) / sr
+        audio_tensor = torch.from_numpy(audio_data).to(self.device)
 
         chunk_size = 30 * 16000
         all_log_probs = []
@@ -140,10 +141,10 @@ class AlignmentEngine:
                 log_probs = torch.log_softmax(logits, dim=-1).cpu()
                 all_log_probs.append(log_probs)
             
+            if not all_log_probs:
+                return []
             combined_log_probs = torch.cat(all_log_probs, dim=1)[0].numpy()
 
-        reference_text = self._normalize_arabic(reference_text)
-        words = reference_text.split()
         vocab = self.wav2vec2_processor.tokenizer.get_vocab()
         inv_vocab = {v: k for k, v in vocab.items()}
         char_list = [inv_vocab[i] for i in range(len(inv_vocab))]
@@ -155,18 +156,94 @@ class AlignmentEngine:
         try:
             results = ctc_segmentation(config, combined_log_probs, words)
         except Exception as e:
-            print(f"[CTC-Seg] Error: {e}")
-            return self._linear_fallback(words, duration)
+            print(f"[CTC-Seg] Local Error: {e}")
+            return []
 
         word_alignments = []
         for i, segment in enumerate(results):
             word_alignments.append({
                 "word":       words[i],
-                "start":      round(float(segment[0]), 3),
-                "end":        round(float(segment[1]), 3),
+                "start":      round(float(segment[0]) + offset, 3),
+                "end":        round(float(segment[1]) + offset, 3),
                 "confidence": round(min(1.0, float(np.exp(segment[2]))), 2),
             })
         return word_alignments
+
+    def align(self, audio_path: str, reference_text: str) -> List[Dict]:
+        speech, sr = sf.read(audio_path, dtype='float32')
+        if len(speech.shape) > 1: speech = speech.mean(axis=1)
+        reference_text = self._normalize_arabic(reference_text)
+        words = reference_text.split()
+        return self.align_ctc(speech, sr, words)
+
+    def align_hybrid(self, audio_path: str, reference_text: str) -> List[Dict]:
+        """
+        Hybrid Pro: WhisperX anchors + Segmented CTC refinement.
+        """
+        print("[Hybrid-Pro] Starting alignment...")
+        
+        # 1. WhisperX Global Pass
+        w_alignments = self.align_whisperx(audio_path, reference_text)
+        
+        # 2. Anchor Identification
+        # An anchor is a word with high confidence that matches the reference.
+        anchors = []
+        for i, entry in enumerate(w_alignments):
+            if entry["confidence"] > 0.85:
+                anchors.append(i)
+        
+        if not anchors:
+            print("[Hybrid-Pro] No anchors found, falling back to WhisperX.")
+            return w_alignments
+
+        # 3. Local CTC Refinement
+        speech, sr = sf.read(audio_path, dtype='float32')
+        if len(speech.shape) > 1: speech = speech.mean(axis=1)
+        
+        refined_alignments = []
+        last_anchor_idx = -1
+        
+        # Reference words
+        ref_words = [w["word"] for w in w_alignments]
+
+        for current_anchor_idx in anchors + [len(w_alignments)]:
+            # Segment between anchors
+            gap_start_idx = last_anchor_idx + 1
+            gap_end_idx = current_anchor_idx # Exclusive
+            
+            if gap_start_idx < gap_end_idx:
+                # We have a gap to refine
+                # Define time window from WhisperX
+                t_start = w_alignments[gap_start_idx]["start"] - 0.2
+                t_end = w_alignments[gap_end_idx - 1]["end"] + 0.2 if gap_end_idx < len(w_alignments) else (len(speech)/sr)
+                
+                t_start = max(0, t_start)
+                t_end = min(len(speech)/sr, t_end)
+                
+                # Extract audio
+                start_sample = int(t_start * sr)
+                end_sample = int(t_end * sr)
+                sub_audio = speech[start_sample:end_sample]
+                sub_words = ref_words[gap_start_idx:gap_end_idx]
+                
+                print(f"[Hybrid-Pro] Refining gap: {gap_start_idx}-{gap_end_idx-1} ({t_start:.1f}s to {t_end:.1f}s)")
+                
+                ctc_results = self.align_ctc(sub_audio, sr, sub_words, offset=t_start)
+                
+                if len(ctc_results) == len(sub_words):
+                    refined_alignments.extend(ctc_results)
+                else:
+                    print(f"[Hybrid-Pro] CTC failed for gap {gap_start_idx}, using WhisperX fallback.")
+                    refined_alignments.extend(w_alignments[gap_start_idx:gap_end_idx])
+            
+            # Add the anchor word itself (refined by CTC if possible, or kept as is)
+            if current_anchor_idx < len(w_alignments):
+                # Optionally refine the anchor word too with a very small window
+                anchor_word = w_alignments[current_anchor_idx]
+                refined_alignments.append(anchor_word)
+                last_anchor_idx = current_anchor_idx
+
+        return refined_alignments
 
     def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
         return self.align(audio_path, reference_text)
