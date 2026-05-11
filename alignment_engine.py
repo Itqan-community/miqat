@@ -178,70 +178,83 @@ class AlignmentEngine:
 
     def align_hybrid(self, audio_path: str, reference_text: str) -> List[Dict]:
         """
-        Hybrid Pro: WhisperX anchors + Segmented CTC refinement.
+        Hybrid Pro v2: Anchor-to-Anchor segmented CTC refinement.
         """
-        print("[Hybrid-Pro] Starting alignment...")
+        print("[Hybrid-Pro] Starting alignment v2...")
         
         # 1. WhisperX Global Pass
         w_alignments = self.align_whisperx(audio_path, reference_text)
         
         # 2. Anchor Identification
-        # An anchor is a word with high confidence that matches the reference.
+        # An anchor is a word with very high confidence.
         anchors = []
         for i, entry in enumerate(w_alignments):
-            if entry["confidence"] > 0.85:
+            if entry["confidence"] > 0.92: # More strict for v2
                 anchors.append(i)
         
         if not anchors:
-            print("[Hybrid-Pro] No anchors found, falling back to WhisperX.")
+            print("[Hybrid-Pro] No strong anchors found, falling back to WhisperX.")
             return w_alignments
 
         # 3. Local CTC Refinement
         speech, sr = sf.read(audio_path, dtype='float32')
         if len(speech.shape) > 1: speech = speech.mean(axis=1)
+        duration_total = len(speech) / sr
         
         refined_alignments = []
         last_anchor_idx = -1
+        last_anchor_end_time = 0.0
         
         # Reference words
         ref_words = [w["word"] for w in w_alignments]
 
-        for current_anchor_idx in anchors + [len(w_alignments)]:
-            # Segment between anchors
+        # Add a virtual end anchor
+        anchor_indices = anchors + [len(w_alignments)]
+
+        for current_anchor_idx in anchor_indices:
             gap_start_idx = last_anchor_idx + 1
-            gap_end_idx = current_anchor_idx # Exclusive
+            gap_end_idx = current_anchor_idx
             
+            # Determine window end time
+            if current_anchor_idx < len(w_alignments):
+                current_anchor_start_time = w_alignments[current_anchor_idx]["start"]
+            else:
+                current_anchor_start_time = duration_total
+
             if gap_start_idx < gap_end_idx:
-                # We have a gap to refine
-                # Define time window from WhisperX
-                t_start = w_alignments[gap_start_idx]["start"] - 0.2
-                t_end = w_alignments[gap_end_idx - 1]["end"] + 0.2 if gap_end_idx < len(w_alignments) else (len(speech)/sr)
+                # We have words between anchors (or before the first anchor)
+                # WINDOW: From the end of the last anchor to the start of the current anchor
+                t_start = max(0, last_anchor_end_time - 0.3)
+                t_end = min(duration_total, current_anchor_start_time + 0.3)
                 
-                t_start = max(0, t_start)
-                t_end = min(len(speech)/sr, t_end)
-                
-                # Extract audio
                 start_sample = int(t_start * sr)
                 end_sample = int(t_end * sr)
                 sub_audio = speech[start_sample:end_sample]
                 sub_words = ref_words[gap_start_idx:gap_end_idx]
                 
-                print(f"[Hybrid-Pro] Refining gap: {gap_start_idx}-{gap_end_idx-1} ({t_start:.1f}s to {t_end:.1f}s)")
+                print(f"[Hybrid-Pro] Refining gap {gap_start_idx}-{gap_end_idx-1} in window [{t_start:.2f}s, {t_end:.2f}s]")
                 
                 ctc_results = self.align_ctc(sub_audio, sr, sub_words, offset=t_start)
                 
                 if len(ctc_results) == len(sub_words):
                     refined_alignments.extend(ctc_results)
                 else:
-                    print(f"[Hybrid-Pro] CTC failed for gap {gap_start_idx}, using WhisperX fallback.")
+                    print(f"[Hybrid-Pro] CTC failed for gap {gap_start_idx}, fallback to WhisperX.")
                     refined_alignments.extend(w_alignments[gap_start_idx:gap_end_idx])
             
-            # Add the anchor word itself (refined by CTC if possible, or kept as is)
+            # Add the anchor word itself
             if current_anchor_idx < len(w_alignments):
-                # Optionally refine the anchor word too with a very small window
                 anchor_word = w_alignments[current_anchor_idx]
                 refined_alignments.append(anchor_word)
+                last_anchor_end_time = anchor_word["end"]
                 last_anchor_idx = current_anchor_idx
+
+        # Final cleanup: ensure timestamps are non-decreasing
+        for i in range(1, len(refined_alignments)):
+            if refined_alignments[i]["start"] < refined_alignments[i-1]["end"]:
+                refined_alignments[i]["start"] = refined_alignments[i-1]["end"]
+            if refined_alignments[i]["end"] < refined_alignments[i]["start"]:
+                refined_alignments[i]["end"] = refined_alignments[i]["start"] + 0.1
 
         return refined_alignments
 
