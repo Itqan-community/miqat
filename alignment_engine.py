@@ -280,13 +280,31 @@ class AlignmentEngine:
             else:
                 final_alignments.append(w_entry)
 
-        for i in range(1, len(final_alignments)):
-            if final_alignments[i]["start"] < final_alignments[i-1]["end"]:
-                final_alignments[i]["start"] = final_alignments[i-1]["end"]
-            if final_alignments[i]["end"] <= final_alignments[i]["start"]:
-                final_alignments[i]["end"] = final_alignments[i]["start"] + 0.1
+        # Final pass: Sanitize timestamps and apply Tail Expansion
+        for i in range(len(final_alignments)):
+            # 1. Non-decreasing check
+            if i > 0:
+                if final_alignments[i]["start"] < final_alignments[i-1]["end"]:
+                    final_alignments[i]["start"] = final_alignments[i-1]["end"]
+            
+            # 2. Tail Expansion (The "Madd" and "Breath" fix)
+            # If there is a gap between this word and the next, expand this word to fill it.
+            if i < len(final_alignments) - 1:
+                next_start = final_alignments[i+1]["start"]
+                current_end = final_alignments[i]["end"]
+                gap = next_start - current_end
+                if gap > 0.1:
+                    # Fill the gap, leaving only 0.1s buffer before the next word
+                    final_alignments[i]["end"] = round(next_start - 0.1, 3)
+            else:
+                # Last word of the entire segment: extend by 1.5s to cover the final breath
+                final_alignments[i]["end"] = round(final_alignments[i]["end"] + 1.5, 3)
 
-        print(f"[Hybrid-Pro] Fusion complete.")
+            # 3. Final safety check (ensure end > start)
+            if final_alignments[i]["end"] <= final_alignments[i]["start"]:
+                final_alignments[i]["end"] = round(final_alignments[i]["start"] + 0.1, 3)
+
+        print(f"[Hybrid-Pro] Fusion complete. Tail expansion applied.")
         return final_alignments
 
     def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
