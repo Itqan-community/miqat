@@ -192,7 +192,10 @@ class AlignmentEngine:
         path = self._backtrack(trellis, emission, tokens)
 
         transition_frames = [p for p in path if p.get('is_changed')]
+        is_linear_fallback = False
+        
         if len(transition_frames) < len(tokens):
+            is_linear_fallback = True
             step = emission.shape[0] / max(len(tokens), 1)
             transition_frames = [
                 {'time_index': int(i * step), 'token_index': i}
@@ -202,10 +205,12 @@ class AlignmentEngine:
         ratio = len(audio_tensor) / 16000 / emission.shape[0]
         total_duration = len(audio_tensor) / 16000
         word_alignments = []
+        
+        # Calculate a basic confidence score: 1.0 if CTC found a path, 0.2 if it failed and used linear fallback
+        score = 0.95 if not is_linear_fallback else 0.2
 
         for i, word in enumerate(words):
             start_idx, end_idx = word_token_spans[i]
-
             start_frame = transition_frames[start_idx]['time_index']
             start_time = round(start_frame * ratio, 3)
 
@@ -221,17 +226,14 @@ class AlignmentEngine:
                     gap = next_start_time - end_time
                     end_time += min(gap, 0.05) if gap > 0 else -0.03
                 else:
-                    # Last word: extend to the actual audio end (covers long madd)
                     end_time = total_duration
             else:
                 if i == len(words) - 1:
-                    # Last word with no next transition: use full audio end
                     end_time = total_duration
                 else:
                     end_frame = transition_frames[end_idx]['time_index']
                     end_time = round((end_frame + 10) * ratio, 3)
 
-            # For the last word, always ensure it reaches the audio end
             if i == len(words) - 1:
                 end_time = total_duration
             else:
@@ -243,14 +245,10 @@ class AlignmentEngine:
                 "word":       word,
                 "start":      round(start_time, 3),
                 "end":        round(end_time, 3),
-                "confidence": 0.9,
+                "confidence": score,
             })
 
-        print(f"[Alignment] Generated {len(word_alignments)} word timestamps:")
-        for wa in word_alignments:
-            print(f"  {wa['word']}: {wa['start']}s - {wa['end']}s (conf: {wa['confidence']})")
-
-        return word_alignments
+        return word_alignments, score
 
     # ─── Whisper alignment ────────────────────────────────────────────────────
 
@@ -515,13 +513,36 @@ class AlignmentEngine:
             sf.write(chunk_tmp, chunk_speech, sr)
 
             try:
-                ctc_result = self.align(chunk_tmp, chunk_text)
+                ctc_result, score = self.align(chunk_tmp, chunk_text)
+                
+                # --- RESYNC LOGIC ---
+                # If score is very low, CTC is faking it. Try to find the true anchor using Whisper.
+                if score < 0.4 and not is_last_chunk:
+                    print(f"[SmartAlign] Low confidence ({score}). Attempting Whisper Resync...")
+                    # Run a 10s whisper transcription from the middle of the chunk
+                    whisper_sample = chunk_speech[sr*5 : sr*15] if len(chunk_speech) > sr*15 else chunk_speech
+                    if len(whisper_sample) > 16000:
+                        raw_transcription = self.transcribe_chunk(whisper_sample)
+                        norm_trans = self._normalize_arabic(raw_transcription)
+                        
+                        # Find where this transcription fits in the reference text (search radius: 500 words)
+                        search_start = max(0, current_word_idx - 100)
+                        search_end   = min(total_words, current_word_idx + 500)
+                        
+                        found_idx = self._find_best_word_match(norm_trans, ref_words[search_start:search_end])
+                        if found_idx != -1:
+                            global_found_idx = search_start + found_idx
+                            print(f"[SmartAlign] Resync successful! Anchor found at index {global_found_idx}")
+                            
+                            # Adjust index and retry aligning with a fresh start
+                            current_word_idx = global_found_idx
+                            pos_sec += 5.0 # Skip the confusing part
+                            continue 
 
                 valid_alignments = []
                 words_consumed   = 0
 
                 for i, wa in enumerate(ctc_result):
-                    # Stop before the squished tail region (except on the last chunk)
                     if not is_last_chunk and wa['end'] > safe_zone_sec:
                         break
 
@@ -531,28 +552,23 @@ class AlignmentEngine:
                     words_consumed = i + 1
 
                 if not valid_alignments:
-                    print("[SmartAlign] WARNING: No valid words found in chunk. Skipping forward.")
-                    pos_sec += chunk_sec - overlap_sec
+                    print("[SmartAlign] WARNING: No valid words found. Advancing audio.")
+                    pos_sec += chunk_sec / 2.0
                     continue
 
                 final_alignments.extend(valid_alignments)
-
-                # Advance word pointer by the actual number of words consumed
                 current_word_idx += words_consumed
 
                 if is_last_chunk or current_word_idx >= total_words:
                     break
 
-                # Next chunk starts just before the last aligned word's end time
                 last_end = valid_alignments[-1]['end']
-                next_start_sec = max(last_end - (overlap_sec / 2.0), pos_sec + 1.0)
-                if next_start_sec <= pos_sec:
-                    next_start_sec = pos_sec + (chunk_sec - overlap_sec)
+                next_start_sec = max(last_end - (overlap_sec / 4.0), pos_sec + 2.0)
                 pos_sec = next_start_sec
 
             except Exception as e:
-                print(f"[SmartAlign] Error in chunk: {e}")
-                pos_sec += chunk_sec - overlap_sec
+                print(f"[SmartAlign] Error: {e}")
+                pos_sec += 30.0
 
             finally:
                 if os.path.exists(chunk_tmp):
@@ -562,6 +578,32 @@ class AlignmentEngine:
                 gc.collect()
 
         return final_alignments
+
+    def transcribe_chunk(self, speech_np: np.ndarray) -> str:
+        """Helper to quickly transcribe a small audio segment."""
+        if not self.whisper_model: self.load_models()
+        input_features = self.whisper_processor(speech_np, sampling_rate=16000, return_tensors="pt").input_features.to(self.device)
+        predicted_ids = self.whisper_model.generate(input_features)
+        return self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+
+    def _find_best_word_match(self, snippet: str, search_words: List[str]) -> int:
+        """Finds the starting index of 'snippet' within 'search_words' using fuzzy matching."""
+        snippet_words = snippet.split()
+        if not snippet_words: return -1
+        
+        best_score = 0
+        best_idx = -1
+        
+        # Look for the first 3 words of the snippet
+        anchor = " ".join(snippet_words[:3])
+        for i in range(len(search_words) - 3):
+            candidate = " ".join(search_words[i:i+3])
+            score = fuzz.ratio(anchor, candidate)
+            if score > 85 and score > best_score:
+                best_score = score
+                best_idx = i
+        
+        return best_idx
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
