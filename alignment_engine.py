@@ -35,32 +35,41 @@ class AlignmentEngine:
 
     # ─── WhisperX Implementation ─────────────────────────────────────────────
 
+    def _normalize_arabic(self, text: str, for_ctc: bool = False) -> str:
+        """
+        Enhanced normalization for Arabic. 
+        for_ctc=True removes all special Quranic marks that Wav2Vec2 usually doesn't recognize.
+        """
+        # Remove diacritics
+        text = re.sub(r'[\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]', '', text)
+        
+        if for_ctc:
+            # Normalize Alefs
+            text = re.sub(r'[أإآٱ]', 'ا', text)
+            # Normalize Hamza on Ya and Waw (optional, but safer for some models)
+            # text = re.sub(r'[ؤئ]', 'ء', text)
+            # Remove any non-arabic letters except space
+            text = re.sub(r'[^\u0621-\u064A\s]', '', text)
+            
+        return text.strip()
+
     def align_whisperx(self, audio_path: str, reference_text: str) -> List[Dict]:
         """
-        State-of-the-art alignment using WhisperX (Whisper + Phoneme Alignment).
+        State-of-the-art alignment using WhisperX + Robust DP Mapping.
         """
         import whisperx
         import torch
 
         print("[WhisperX] Starting alignment...")
-        # 1. Load Model (Lazy)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
         
-        # Load whisper model for transcription if not already loaded as whisperx
         model = whisperx.load_model("large-v2", device, compute_type=compute_type, language="ar")
-
-        # 2. Transcribe with VAD
         audio = whisperx.load_audio(audio_path)
         result = model.transcribe(audio, batch_size=16)
         
-        # 3. Align with language-specific model (Arabic)
         model_a, metadata = whisperx.load_align_model(language_code="ar", device=device)
         result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-        
-        # 4. Map to reference text
-        # WhisperX gives us word-level timestamps directly. 
-        # We need to map these to the provided reference_text using fuzzy matching.
         
         extracted_words = []
         for segment in result["segments"]:
@@ -74,35 +83,65 @@ class AlignmentEngine:
                             "confidence": w.get("score", 0.9)
                         })
 
-        # Fuzzy mapping to reference words to maintain the exact reference text structure
-        ref_words = self._normalize_arabic(reference_text).split()
-        mapped_alignments = []
+        # --- Robust DP Mapping (Longest Common Subsequence style) ---
+        ref_words = reference_text.split()
+        n = len(ref_words)
+        m = len(extracted_words)
         
-        # Simple greedy mapping for now
-        last_found_idx = 0
-        for ref_w in ref_words:
-            found = False
-            # Search in a window of the extracted words
-            search_window = extracted_words[max(0, last_found_idx - 5) : last_found_idx + 20]
-            for i, ext_w in enumerate(search_window):
-                if fuzz.ratio(self._normalize_arabic(ref_w), self._normalize_arabic(ext_w["word"])) > 75:
-                    mapped_alignments.append({
-                        "word": ref_w,
-                        "start": ext_w["start"],
-                        "end": ext_w["end"],
-                        "confidence": ext_w["confidence"]
-                    })
-                    last_found_idx = max(0, last_found_idx - 5) + i + 1
-                    found = True
-                    break
+        # Scoring matrix: dp[i][j] = max score matching ref_words[:i] with extracted_words[:j]
+        dp = np.zeros((n + 1, m + 1))
+        
+        # Fill DP table
+        for i in range(1, n + 1):
+            rw = self._normalize_arabic(ref_words[i-1], for_ctc=True)
+            for j in range(1, m + 1):
+                ew = self._normalize_arabic(extracted_words[j-1]["word"], for_ctc=True)
+                
+                # Match score (fuzzy ratio)
+                match_score = fuzz.ratio(rw, ew) / 100.0
+                if match_score < 0.6: match_score = -1.0 # Penalty for bad matches
+                
+                # We want to match as many as possible correctly
+                dp[i][j] = max(
+                    dp[i-1][j],      # Skip ref word
+                    dp[i][j-1],      # Skip extracted word
+                    dp[i-1][j-1] + match_score # Match
+                )
+        
+        # Backtrack to find optimal mapping
+        mapped_alignments = [None] * n
+        i, j = n, m
+        while i > 0 and j > 0:
+            rw = self._normalize_arabic(ref_words[i-1], for_ctc=True)
+            ew = self._normalize_arabic(extracted_words[j-1]["word"], for_ctc=True)
+            match_score = fuzz.ratio(rw, ew) / 100.0
             
-            if not found:
-                # Interpolate or use fallback for missing words
-                prev_end = mapped_alignments[-1]["end"] if mapped_alignments else 0
-                mapped_alignments.append({
-                    "word": ref_w,
+            if match_score >= 0.6 and dp[i][j] == dp[i-1][j-1] + match_score:
+                mapped_alignments[i-1] = extracted_words[j-1]
+                i -= 1
+                j -= 1
+            elif dp[i][j] == dp[i-1][j]:
+                i -= 1
+            else:
+                j -= 1
+        
+        # Finalize results with interpolation for missing words
+        final_results = []
+        for k in range(n):
+            if mapped_alignments[k]:
+                final_results.append({
+                    "word": ref_words[k],
+                    "start": mapped_alignments[k]["start"],
+                    "end": mapped_alignments[k]["end"],
+                    "confidence": mapped_alignments[k]["confidence"]
+                })
+            else:
+                # Interpolate missing word timing
+                prev_end = final_results[-1]["end"] if final_results else 0
+                final_results.append({
+                    "word": ref_words[k],
                     "start": prev_end,
-                    "end": prev_end + 0.2,
+                    "end": prev_end + 0.1,
                     "confidence": 0.0
                 })
 
@@ -112,9 +151,18 @@ class AlignmentEngine:
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         
-        return mapped_alignments
+        return final_results
 
-    # ─── CTC Segmentation (Previous) ──────────────────────────────────────────
+    def transcribe(self, audio_path: str) -> str:
+        if not self.whisper_model: self.load_models()
+        speech, sr = sf.read(audio_path, dtype='float32')
+        if len(speech.shape) > 1: speech = speech.mean(axis=1)
+        if sr != 16000: speech = librosa.resample(speech, orig_sr=sr, target_sr=16000)
+        input_features = self.whisper_processor(speech, sampling_rate=16000, return_tensors="pt").input_features.to(self.device)
+        predicted_ids = self.whisper_model.generate(input_features)
+        return self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+
+    # ─── CTC Segmentation ─────────────────────────────────────────────────────
 
     def align_ctc(self, audio_data: np.ndarray, sr: int, words: List[str], offset: float = 0.0) -> List[Dict]:
         """
@@ -153,8 +201,15 @@ class AlignmentEngine:
         config.char_list = char_list
         config.index_duration = duration / combined_log_probs.shape[0]
         
+        # CLEAN WORDS FOR CTC: This is crucial to avoid "invalid literal" errors
+        clean_words = [self._normalize_arabic(w, for_ctc=True) for w in words]
+        clean_words = [w for w in clean_words if w]
+        
+        if not clean_words:
+            return []
+
         try:
-            results = ctc_segmentation(config, combined_log_probs, words)
+            results = ctc_segmentation(config, combined_log_probs, clean_words)
         except Exception as e:
             print(f"[CTC-Seg] Local Error: {e}")
             return []
@@ -162,7 +217,7 @@ class AlignmentEngine:
         word_alignments = []
         for i, segment in enumerate(results):
             word_alignments.append({
-                "word":       words[i],
+                "word":       words[i], 
                 "start":      round(float(segment[0]) + offset, 3),
                 "end":        round(float(segment[1]) + offset, 3),
                 "confidence": round(min(1.0, float(np.exp(segment[2]))), 2),
@@ -172,7 +227,6 @@ class AlignmentEngine:
     def align(self, audio_path: str, reference_text: str) -> List[Dict]:
         speech, sr = sf.read(audio_path, dtype='float32')
         if len(speech.shape) > 1: speech = speech.mean(axis=1)
-        reference_text = self._normalize_arabic(reference_text)
         words = reference_text.split()
         return self.align_ctc(speech, sr, words)
 
@@ -180,52 +234,37 @@ class AlignmentEngine:
         """
         Hybrid Pro v3 (Fusion-Pro): WhisperX Backbone + CTC Micro-Refinement.
         """
-        print("[Hybrid-Pro] Starting Fusion-Pro v3...")
-        
-        # 1. WhisperX Base Pass (The reliable sequence)
+        print("[Hybrid-Pro] Starting Fusion-Pro v3 (DP Optimized)...")
         w_alignments = self.align_whisperx(audio_path, reference_text)
-        
-        # 2. CTC Base Pass (The precise candidate)
-        # We run CTC on the whole audio to get a full candidate set
         c_alignments = self.align(audio_path, reference_text)
         
-        # 3. Intelligent Fusion
         final_alignments = []
-        
-        # Create a searchable map of CTC results by word text
-        # (Using a sliding window or index search because words repeat)
         c_idx = 0
         
         for w_entry in w_alignments:
-            word_text = self._normalize_arabic(w_entry["word"])
+            word_text = self._normalize_arabic(w_entry["word"], for_ctc=True)
             best_ctc = None
-            min_dist = 0.6 # Max allowed distance to trust CTC (seconds)
+            min_dist = 0.6 
             
-            # Look for a matching word in CTC results within a time window
-            # Search nearby indices in c_alignments to handle repetitions correctly
             search_start = max(0, c_idx - 5)
             search_end = min(len(c_alignments), c_idx + 10)
             
             for i in range(search_start, search_end):
                 c_entry = c_alignments[i]
-                c_text = self._normalize_arabic(c_entry["word"])
+                c_text = self._normalize_arabic(c_entry["word"], for_ctc=True)
                 
                 if word_text == c_text:
-                    # Check temporal distance between centers
                     dist = abs(((w_entry["start"] + w_entry["end"])/2) - ((c_entry["start"] + c_entry["end"])/2))
                     if dist < min_dist:
                         best_ctc = c_entry
                         min_dist = dist
-                        c_idx = i + 1 # Move CTC pointer forward
+                        c_idx = i + 1 
                         break
             
             if best_ctc and best_ctc["confidence"] > 0.4:
-                # Use CTC for precision, but clamp to a reasonable window around WhisperX
-                # to prevent radical jumps
                 refined_start = best_ctc["start"]
                 refined_end = best_ctc["end"]
                 
-                # Boundary check: don't drift more than 0.5s from WhisperX
                 if abs(refined_start - w_entry["start"]) > 0.5:
                     refined_start = w_entry["start"]
                 if abs(refined_end - w_entry["end"]) > 0.5:
@@ -235,48 +274,26 @@ class AlignmentEngine:
                     "word": w_entry["word"],
                     "start": round(refined_start, 3),
                     "end": round(refined_end, 3),
-                    "confidence": max(w_entry["confidence"], best_ctc["confidence"])
+                    "confidence": max(w_entry["confidence"], best_ctc["confidence"]),
+                    "refined": True
                 })
             else:
-                # Fallback to WhisperX backbone (Robust)
                 final_alignments.append(w_entry)
 
-        # Final pass: Sanitize timestamps (non-decreasing)
         for i in range(1, len(final_alignments)):
-            # Ensure no negative duration and no overlap
             if final_alignments[i]["start"] < final_alignments[i-1]["end"]:
-                # If they overlap, find a middle ground or nudge
-                overlap = final_alignments[i-1]["end"] - final_alignments[i]["start"]
-                if overlap < 0.2:
-                    final_alignments[i]["start"] = final_alignments[i-1]["end"]
-                else:
-                    # Significant overlap, keep WhisperX's original start if possible
-                    pass 
-            
+                final_alignments[i]["start"] = final_alignments[i-1]["end"]
             if final_alignments[i]["end"] <= final_alignments[i]["start"]:
                 final_alignments[i]["end"] = final_alignments[i]["start"] + 0.1
 
-        print(f"[Hybrid-Pro] Fusion complete. Refined {len([a for a in final_alignments if a.get('refined', False)])} words.")
+        print(f"[Hybrid-Pro] Fusion complete.")
         return final_alignments
 
     def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
-        return self.align(audio_path, reference_text)
+        return self.align_hybrid(audio_path, reference_text)
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
-
-    def _normalize_arabic(self, text: str) -> str:
-        pattern = re.compile(r'[\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED]')
-        return pattern.sub('', text)
 
     def _linear_fallback(self, words: List[str], duration: float) -> List[Dict]:
         step = duration / max(len(words), 1)
         return [{"word": w, "start": round(i * step, 3), "end": round((i + 1) * step, 3), "confidence": 0.1} for i, w in enumerate(words)]
-
-    def transcribe(self, audio_path: str) -> str:
-        if not self.whisper_model: self.load_models()
-        speech, sr = sf.read(audio_path, dtype='float32')
-        if len(speech.shape) > 1: speech = speech.mean(axis=1)
-        if sr != 16000: speech = librosa.resample(speech, orig_sr=sr, target_sr=16000)
-        input_features = self.whisper_processor(speech, sampling_rate=16000, return_tensors="pt").input_features.to(self.device)
-        predicted_ids = self.whisper_model.generate(input_features)
-        return self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
