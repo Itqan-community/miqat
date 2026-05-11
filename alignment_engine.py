@@ -78,33 +78,92 @@ class AlignmentEngine:
         ref_words = self._normalize_arabic(reference_text).split()
         mapped_alignments = []
         
-        # Simple greedy mapping for now
-        last_found_idx = 0
-        for ref_w in ref_words:
-            found = False
-            # Search in a window of the extracted words
-            search_window = extracted_words[max(0, last_found_idx - 5) : last_found_idx + 20]
-            for i, ext_w in enumerate(search_window):
-                if fuzz.ratio(self._normalize_arabic(ref_w), self._normalize_arabic(ext_w["word"])) > 75:
-                    mapped_alignments.append({
-                        "word": ref_w,
-                        "start": ext_w["start"],
-                        "end": ext_w["end"],
-                        "confidence": ext_w["confidence"]
-                    })
-                    last_found_idx = max(0, last_found_idx - 5) + i + 1
-                    found = True
-                    break
+        # Robust DP mapping to reference words
+        # This ensures that repetitive patterns (Mutashabihat) are correctly aligned
+        # by finding the globally optimal mapping instead of a local greedy one.
+        
+        ext_words_norm = [self._normalize_arabic(w["word"]) for w in extracted_words]
+        ref_words_norm = [self._normalize_arabic(w) for w in ref_words]
+        
+        n, m = len(ref_words_norm), len(ext_words_norm)
+        if n == 0: return []
+        if m == 0: 
+            # Use audio duration if possible, but librosa load was not done in this method
+            # We'll use a dummy duration or fallback
+            return self._linear_fallback(ref_words, 1.0) 
+
+        # DP table for alignment score calculation
+        dp = np.zeros((n + 1, m + 1))
+        
+        # Filling the DP table
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                # Calculate match score using fuzzy ratio
+                ratio = fuzz.ratio(ref_words_norm[i-1], ext_words_norm[j-1]) / 100.0
+                # match_score is higher for better matches
+                match_score = (ratio * 2.0) - 1.0
+                
+                # Option 1: Match ref[i-1] with ext[j-1]
+                # Option 2: Skip ref[i-1] (deletion)
+                # Option 3: Skip ext[j-1] (insertion)
+                dp[i][j] = max(
+                    dp[i-1][j-1] + match_score, 
+                    dp[i-1][j] - 0.5, 
+                    dp[i][j-1] - 0.5
+                )
+        
+        # Backtrack to find the optimal mapping
+        mapping = {}
+        i, j = n, m
+        while i > 0 and j > 0:
+            ratio = fuzz.ratio(ref_words_norm[i-1], ext_words_norm[j-1]) / 100.0
+            match_score = (ratio * 2.0) - 1.0
             
-            if not found:
-                # Interpolate or use fallback for missing words
-                prev_end = mapped_alignments[-1]["end"] if mapped_alignments else 0
+            if dp[i][j] >= dp[i-1][j-1] + match_score - 1e-5 and ratio > 0.4:
+                mapping[i-1] = j-1
+                i -= 1
+                j -= 1
+            elif dp[i][j] >= dp[i-1][j] - 0.5 - 1e-5:
+                i -= 1
+            else:
+                j -= 1
+        
+        # Construct the final mapped alignments with smart interpolation
+        mapped_alignments = []
+        last_ext_end = 0
+        
+        for k in range(n):
+            if k in mapping:
+                ext_w = extracted_words[mapping[k]]
                 mapped_alignments.append({
-                    "word": ref_w,
-                    "start": prev_end,
-                    "end": prev_end + 0.2,
+                    "word": ref_words[k],
+                    "start": ext_w["start"],
+                    "end": ext_w["end"],
+                    "confidence": ext_w["confidence"]
+                })
+                last_ext_end = ext_w["end"]
+            else:
+                # Interpolation for missing words
+                next_start = -1
+                for next_k in range(k + 1, n):
+                    if next_k in mapping:
+                        next_start = extracted_words[mapping[next_k]]["start"]
+                        break
+                
+                start = last_ext_end
+                if next_start == -1:
+                    end = start + 0.2
+                else:
+                    # Distribute the gap (very simple interpolation)
+                    end = min(next_start, start + 0.2)
+                
+                mapped_alignments.append({
+                    "word": ref_words[k],
+                    "start": round(start, 3),
+                    "end": round(end, 3),
                     "confidence": 0.0
                 })
+                last_ext_end = end
 
         # Cleanup memory
         del model
