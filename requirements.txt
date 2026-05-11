@@ -3,7 +3,7 @@ transformers
 soundfile
 librosa
 rapidfuzz
-numpy
+numpy<2.0.0
 ctc-segmentation
 fastapi
 uvicorn
