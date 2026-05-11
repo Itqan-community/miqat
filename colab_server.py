@@ -56,13 +56,15 @@ def _run_job(job_id: str, file_path: str, reference_text: str, method: str):
 
         print(f"[Job {job_id[:8]}] method={method}, duration={duration:.1f}s")
 
-        if method == "whisper":
+        if method == "whisperx":
+            alignments = alignment_engine.align_whisperx(file_path, reference_text)
+        elif method == "whisper":
             alignments = alignment_engine.align_whisper(file_path, reference_text)
         elif duration > 35:
-            # Long audio: chunked smart alignment
+            # Long audio: robust ctc-segmentation
             alignments = alignment_engine.align_smart(file_path, reference_text)
         else:
-            # Short audio: direct CTC
+            # Short audio: direct ctc
             alignments = alignment_engine.align(file_path, reference_text)
 
         jobs[job_id] = {
