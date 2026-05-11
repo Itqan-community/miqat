@@ -467,92 +467,93 @@ class AlignmentEngine:
             return self.align(audio_path, reference_text)
 
         # Sliding window parameters
-        chunk_sec = 300.0       # 5 minutes
-        overlap_sec = 30.0      # 30 seconds overlap
-        step_sec = chunk_sec - overlap_sec
+        chunk_sec   = 300.0   # 5 minutes per chunk
+        overlap_sec = 30.0    # 30 seconds overlap between consecutive chunks
 
         reference_text = self._normalize_arabic(reference_text)
-        ref_words = reference_text.split()
+        ref_words   = reference_text.split()
         total_words = len(ref_words)
         words_per_sec = total_words / duration
-        
-        # Provide 3-4x the expected words to guarantee we have enough text for the chunk.
-        # CTC will squish the unused words at the very end.
-        words_per_chunk = max(int(chunk_sec * words_per_sec * 4.0), 1000)
+
+        # KEY FIX: Use 1.5x the expected words per chunk (not 4x).
+        # With 4x, large Surahs had words_per_chunk > total_words, so chunk-0 got
+        # ALL words and CTC squished the entire surah into the first 300 seconds.
+        expected_words_per_chunk = chunk_sec * words_per_sec
+        words_per_chunk = max(int(expected_words_per_chunk * 1.5), 50)
+
+        # Only keep CTC words whose chunk-relative end falls before this cutoff,
+        # to avoid the squished tail CTC produces when it runs out of tokens.
+        safe_zone_sec = chunk_sec - (overlap_sec / 2.0)
 
         final_alignments = []
         current_word_idx = 0
         pos_sec = 0.0
 
         while pos_sec < duration and current_word_idx < total_words:
-            end_sec = min(pos_sec + chunk_sec, duration)
-            is_last_chunk = (end_sec == duration)
-            
+            end_sec       = min(pos_sec + chunk_sec, duration)
+            is_last_chunk = (end_sec >= duration - 0.5)
+
             chunk_start_sample = int(pos_sec * sr)
-            chunk_end_sample = int(end_sec * sr)
-            chunk_speech = speech[chunk_start_sample:chunk_end_sample]
-            
-            # Determine words to pass
-            chunk_words_end = min(current_word_idx + words_per_chunk, total_words)
+            chunk_end_sample   = int(end_sec * sr)
+            chunk_speech       = speech[chunk_start_sample:chunk_end_sample]
+
+            # Slice the reference words for this chunk
             if is_last_chunk:
                 chunk_words_end = total_words
-                
-            chunk_text = " ".join(ref_words[current_word_idx:chunk_words_end])
-            
-            print(f"[SmartAlign] Chunk {pos_sec:.1f}s - {end_sec:.1f}s | Words {current_word_idx} to {chunk_words_end}")
-            
-            # Save temp audio for self.align
+            else:
+                chunk_words_end = min(current_word_idx + words_per_chunk, total_words)
+
+            chunk_ref_words = ref_words[current_word_idx:chunk_words_end]
+            chunk_text      = " ".join(chunk_ref_words)
+
+            print(
+                f"[SmartAlign] Chunk {pos_sec:.1f}s - {end_sec:.1f}s | "
+                f"Words {current_word_idx} to {chunk_words_end} ({len(chunk_ref_words)} words)"
+            )
+
             chunk_tmp = f"{audio_path}_temp.wav"
             sf.write(chunk_tmp, chunk_speech, sr)
-            
+
             try:
-                # align returns alignments relative to the chunk (0.0 to chunk_duration)
                 ctc_result = self.align(chunk_tmp, chunk_text)
-                
+
                 valid_alignments = []
-                last_valid_idx = current_word_idx - 1
-                
-                # Cutoff slightly before the end to avoid the "squished" words
-                cutoff_sec = (end_sec - pos_sec) - (overlap_sec / 2.0)
-                
+                words_consumed   = 0
+
                 for i, wa in enumerate(ctc_result):
-                    global_start = round(wa['start'] + pos_sec, 3)
-                    global_end   = round(wa['end']   + pos_sec, 3)
-                    
-                    if not is_last_chunk and wa['end'] > cutoff_sec:
-                        # Stop adding words if they fall into the tail region
-                        if len(valid_alignments) > 0:
-                            break
-                    
-                    wa['start'] = global_start
-                    wa['end']   = global_end
+                    # Stop before the squished tail region (except on the last chunk)
+                    if not is_last_chunk and wa['end'] > safe_zone_sec:
+                        break
+
+                    wa['start'] = round(wa['start'] + pos_sec, 3)
+                    wa['end']   = round(wa['end']   + pos_sec, 3)
                     valid_alignments.append(wa)
-                    last_valid_idx = current_word_idx + i
-                    
-                final_alignments.extend(valid_alignments)
-                
+                    words_consumed = i + 1
+
                 if not valid_alignments:
-                    print("[SmartAlign] WARNING: No valid words found in chunk. Advancing by step_sec.")
-                    pos_sec += step_sec
+                    print("[SmartAlign] WARNING: No valid words found in chunk. Skipping forward.")
+                    pos_sec += chunk_sec - overlap_sec
                     continue
-                    
-                # Advance variables for next chunk
-                current_word_idx = last_valid_idx + 1
-                
-                # Next audio chunk should start slightly before the last valid word ends
-                next_start_sec = max(pos_sec, final_alignments[-1]['end'] - (overlap_sec / 2.0))
-                
-                # Ensure we always advance at least a little bit to avoid infinite loop
+
+                final_alignments.extend(valid_alignments)
+
+                # Advance word pointer by the actual number of words consumed
+                current_word_idx += words_consumed
+
+                if is_last_chunk or current_word_idx >= total_words:
+                    break
+
+                # Next chunk starts just before the last aligned word's end time
+                last_end = valid_alignments[-1]['end']
+                next_start_sec = max(last_end - (overlap_sec / 2.0), pos_sec + 1.0)
                 if next_start_sec <= pos_sec:
-                    next_start_sec = pos_sec + (overlap_sec / 2.0)
-                    
+                    next_start_sec = pos_sec + (chunk_sec - overlap_sec)
                 pos_sec = next_start_sec
-                
+
             except Exception as e:
                 print(f"[SmartAlign] Error in chunk: {e}")
-                # Fallback: advance blindly
-                pos_sec += step_sec
-                
+                pos_sec += chunk_sec - overlap_sec
+
             finally:
                 if os.path.exists(chunk_tmp):
                     os.remove(chunk_tmp)
