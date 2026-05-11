@@ -89,8 +89,6 @@ class AlignmentEngine:
         n, m = len(ref_words_norm), len(ext_words_norm)
         
         # DP table for alignment score calculation
-        # We use a score-based DP to handle insertions/deletions/mismatches
-        # dp[i][j] stores the best score to align ref_words[:i] with ext_words[:j]
         dp = np.zeros((n + 1, m + 1))
         
         # Filling the DP table
@@ -98,16 +96,16 @@ class AlignmentEngine:
             for j in range(1, m + 1):
                 # Calculate match score using fuzzy ratio
                 ratio = fuzz.ratio(ref_words_norm[i-1], ext_words_norm[j-1]) / 100.0
-                # Reward good matches (>0.8), penalize bad ones
-                match_score = ratio if ratio > 0.8 else -1.0
+                # Leniency: 1.0->1.0, 0.5->0.0, 0.0->-1.0
+                match_score = (ratio * 2.0) - 1.0
                 
                 # Option 1: Match ref[i-1] with ext[j-1]
                 # Option 2: Skip ref[i-1] (deletion in extracted)
                 # Option 3: Skip ext[j-1] (insertion in extracted)
                 dp[i][j] = max(
                     dp[i-1][j-1] + match_score, 
-                    dp[i-1][j] - 0.1,  # Slight penalty for skipping a reference word
-                    dp[i][j-1] - 0.1   # Slight penalty for skipping an extracted word
+                    dp[i-1][j] - 0.3,  # Penalty for skipping a reference word
+                    dp[i][j-1] - 0.3   # Penalty for skipping an extracted word
                 )
         
         # Backtrack to find the optimal mapping
@@ -115,20 +113,22 @@ class AlignmentEngine:
         i, j = n, m
         while i > 0 and j > 0:
             ratio = fuzz.ratio(ref_words_norm[i-1], ext_words_norm[j-1]) / 100.0
-            match_score = ratio if ratio > 0.8 else -1.0
+            match_score = (ratio * 2.0) - 1.0
             
             # Check if current best came from a match
-            if dp[i][j] >= dp[i-1][j-1] + match_score - 1e-5 and ratio > 0.7:
+            if dp[i][j] >= dp[i-1][j-1] + match_score - 1e-5 and ratio > 0.5:
                 mapping[i-1] = j-1
                 i -= 1
                 j -= 1
-            elif dp[i][j] >= dp[i-1][j] - 0.1 - 1e-5:
+            elif dp[i][j] >= dp[i-1][j] - 0.3 - 1e-5:
                 i -= 1
             else:
                 j -= 1
         
-        # Construct the final mapped alignments
+        # Construct the final mapped alignments with smart interpolation
+        total_duration = audio.shape[0] / 16000
         mapped_alignments = []
+        
         for k in range(len(ref_words)):
             if k in mapping:
                 ext_w = extracted_words[mapping[k]]
@@ -139,21 +139,40 @@ class AlignmentEngine:
                     "confidence": ext_w["confidence"]
                 })
             else:
-                # Interpolate for missing words
+                # Smart Interpolation: Distribute time between matches
                 prev_end = mapped_alignments[-1]["end"] if mapped_alignments else 0
-                # Look ahead for the next match to better interpolate
-                next_start = prev_end + 0.2
+                
+                # Find the next match to determine available time window
+                next_start = total_duration
+                missing_count = 1
                 for next_k in range(k + 1, len(ref_words)):
                     if next_k in mapping:
                         next_start = extracted_words[mapping[next_k]]["start"]
                         break
+                    missing_count += 1
+                
+                # Calculate share of time for this specific missing word
+                available_time = max(0, next_start - prev_end)
+                # We are at the 'i-th' word in a block of 'missing_count' words
+                # But here 'k' is the global index. Let's find how many missing words are BEFORE this one in the current block.
+                block_start_k = k
+                for b in range(k - 1, -1, -1):
+                    if b in mapping: break
+                    block_start_k = b
+                
+                pos_in_block = k - block_start_k
+                time_per_word = available_time / missing_count
+                
+                word_start = prev_end + (pos_in_block * time_per_word)
+                word_end = word_start + time_per_word
                 
                 mapped_alignments.append({
                     "word": ref_words[k],
-                    "start": prev_end,
-                    "end": min(prev_end + 0.2, next_start),
+                    "start": round(word_start, 3),
+                    "end": round(word_end, 3),
                     "confidence": 0.0
                 })
+
 
         # Cleanup memory
         del model
