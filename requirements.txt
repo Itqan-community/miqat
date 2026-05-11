@@ -4,9 +4,6 @@ soundfile
 librosa
 rapidfuzz
 numpy<2.0.0
-ctc-segmentation
 fastapi
 uvicorn
 python-multipart
-whisperx
-git+https://github.com/m-bain/whisperx.git
