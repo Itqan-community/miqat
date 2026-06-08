@@ -1,5 +1,6 @@
-torch
-transformers
+torch==2.3.1
+torchaudio==2.3.1
+transformers==4.44.2
 soundfile
 librosa
 rapidfuzz
@@ -7,3 +8,6 @@ numpy<2.0.0
 fastapi
 uvicorn
 python-multipart
+whisperx
+ctc_segmentation
+python-dotenv

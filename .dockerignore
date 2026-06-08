@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyc.*
+git/
+model_local/
+temp_audio/
+uploads/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+*.tar
+*.tar.gz
