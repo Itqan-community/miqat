@@ -1,8 +1,0 @@
-# CPU-only override — merge with the main compose file:
-#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
-#
-# This removes the NVIDIA GPU reservation so the container runs on CPU.
-
-services:
-  colabwis:
-    deploy: null

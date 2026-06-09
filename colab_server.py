@@ -25,10 +25,18 @@ app.add_middleware(
 WHISPER_PATH = "model_local/whisper"
 WAV2VEC2_PATH = "model_local/wav2vec2"
 
+# Device check at module load time
+import torch
+print(f"[Server] torch.cuda.is_available(): {torch.cuda.is_available()}")
+print(f"[Server] torch.version.cuda: {torch.version.cuda}")
+if torch.cuda.is_available():
+    print(f"[Server] GPU: {torch.cuda.get_device_name(0)}, CUDA devices: {torch.cuda.device_count()}")
+
 if not os.path.exists(WHISPER_PATH) or not os.path.exists(WAV2VEC2_PATH):
     print("Warning: Models not found locally. Please run model_downloader.py first.")
 
 alignment_engine = AlignmentEngine(WHISPER_PATH, WAV2VEC2_PATH)
+print(f"[Server] AlignmentEngine device: {alignment_engine.device}")
 os.makedirs("temp_audio", exist_ok=True)
 
 # ─── In-memory job store ───────────────────────────────────────────────────────

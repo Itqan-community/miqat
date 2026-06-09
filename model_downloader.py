@@ -32,23 +32,24 @@ def verify_model(local_dir):
 def download_models():
     models = [
         {"id": "tarteel-ai/whisper-base-ar-quran", "dir": "model_local/whisper"},
-        {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic", "dir": "model_local/wav2vec2"}
+        {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic", "dir": "model_local/wav2vec2"},
+        {"id": "Systran/faster-whisper-large-v2", "dir": "model_local/whisperx"},
     ]
-    
+
     for model in models:
         model_id = model["id"]
         local_dir = model["dir"]
-        
+
         print(f"\n--- Processing model {model_id} ---")
-        
+
         # Clean up interrupted downloads
         clean_lock_files(local_dir)
-        
+
         if not os.path.exists(local_dir):
             os.makedirs(local_dir, exist_ok=True)
-            
+
         print(f"Downloading model {model_id} to {local_dir}...")
-        
+
         try:
             snapshot_download(
                 repo_id=model_id,
@@ -56,12 +57,16 @@ def download_models():
                 local_dir_use_symlinks=False,
                 token=hf_token
             )
-            
-            if verify_model(local_dir):
+
+            # Check for CTranslate2 files (whisperx) or PyTorch files (custom align)
+            has_ct2 = os.path.exists(os.path.join(local_dir, "model.safetensors")) or \
+                      os.path.exists(os.path.join(local_dir, "pytorch_model.bin")) or \
+                      os.path.exists(os.path.join(local_dir, "model.bin"))
+            if has_ct2:
                 print(f"SUCCESS: Model {model_id} verified.")
             else:
-                print(f"WARNING: Model {model_id} downloaded but weights (pytorch_model.bin/safetensors) not found.")
-                
+                print(f"WARNING: Model {model_id} downloaded but weights not found in {local_dir}")
+
         except Exception as e:
             print(f"ERROR downloading model {model_id}: {e}")
 

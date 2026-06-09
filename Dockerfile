@@ -27,12 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ── Layer 1: copy requirements first so pip install is cached ─────
+# ── Install project dependencies ──────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && python3 -c "import glob,subprocess; [subprocess.run(['patchelf','--clear-execstack',s],check=True) for s in glob.glob('/usr/local/lib/python3.11/site-packages/ctranslate2*/**/*.so*',recursive=True)]; print('Done')"
+    && python3 -c "import glob,subprocess; [subprocess.run(['patchelf','--clear-execstack',s],check=True) for s in glob.glob('/usr/local/lib/python3.11/site-packages/ctranslate2*/**/*.so*',recursive=True)]; print('ctranslate2 execstack patched')"
 
-# ── Layer 2: copy the rest of the project ─────────────────────────
+    # ── Layer 2: copy the rest of the project ─────────────────────────
 COPY . .
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
@@ -40,6 +40,7 @@ RUN chmod +x /app/entrypoint.sh
 # Required directories
 RUN mkdir -p /app/model_local/whisper \
              /app/model_local/wav2vec2 \
+             /app/model_local/whisperx \
              /app/temp_audio
 
 ENV HF_TOKEN=""

@@ -23,15 +23,25 @@ class AlignmentEngine:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def load_models(self):
+        print(f"Loading models on device: {self.device}")
+        if self.device == "cuda":
+            print(f"  GPU: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+
         print(f"Loading Whisper model from {self.whisper_path}...")
         self.whisper_processor = WhisperProcessor.from_pretrained(self.whisper_path)
         self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
             self.whisper_path, attn_implementation="eager"
         ).to(self.device)
+        # Verify model is actually on GPU
+        first_param = next(self.whisper_model.parameters())
+        print(f"  Whisper model device: {first_param.device} (expected: {self.device})")
 
         print(f"Loading Wav2Vec2 model from {self.wav2vec2_path}...")
         self.wav2vec2_processor = Wav2Vec2Processor.from_pretrained(self.wav2vec2_path)
         self.wav2vec2_model = Wav2Vec2ForCTC.from_pretrained(self.wav2vec2_path).to(self.device)
+        # Verify model is actually on GPU
+        first_param = next(self.wav2vec2_model.parameters())
+        print(f"  Wav2Vec2 model device: {first_param.device} (expected: {self.device})")
 
     # ─── WhisperX Implementation ─────────────────────────────────────────────
 
@@ -61,10 +71,23 @@ class AlignmentEngine:
         import torch
 
         print("[WhisperX] Starting alignment...")
+        print(f"[WhisperX] CUDA available: {torch.cuda.is_available()}, device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-        
-        model = whisperx.load_model("large-v2", device, compute_type=compute_type, language="ar")
+        print(f"[WhisperX] Using device={device}, compute_type={compute_type}")
+
+        # Use local CTranslate2 model to avoid network download hang
+        local_model_path = os.path.join(os.path.dirname(__file__), "model_local", "whisperx")
+        if os.path.isdir(local_model_path) and os.listdir(local_model_path):
+            print(f"[WhisperX] Using local model: {local_model_path}")
+            model_name = local_model_path
+        else:
+            print("[WhisperX] No local model found, downloading from HF...")
+            model_name = "large-v2"
+
+        print("[WhisperX] Loading model (this may take a minute)...")
+        model = whisperx.load_model(model_name, device, compute_type=compute_type, language="ar")
+        print(f"[WhisperX] Model loaded successfully on {device}")
         audio = whisperx.load_audio(audio_path)
         result = model.transcribe(audio, batch_size=16)
         

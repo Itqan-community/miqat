@@ -4,14 +4,16 @@ set -euo pipefail
 # Create required directories
 mkdir -p /app/model_local/whisper
 mkdir -p /app/model_local/wav2vec2
+mkdir -p /app/model_local/whisperx
 mkdir -p /app/temp_audio
 
 # If HF_TOKEN is set and models don't exist, download them
 if [ -n "${HF_TOKEN:-}" ]; then
     WHISPER_EXISTS=$(ls /app/model_local/whisper/pytorch_model.bin /app/model_local/whisper/model.safetensors 2>/dev/null || true)
     WAV2VEC2_EXISTS=$(ls /app/model_local/wav2vec2/pytorch_model.bin /app/model_local/wav2vec2/model.safetensors 2>/dev/null || true)
+    WHISPERX_EXISTS=$(ls /app/model_local/whisperx/model.safetensors /app/model_local/whisperx/model.bin 2>/dev/null || true)
 
-    if [ -z "$WHISPER_EXISTS" ] || [ -z "$WAV2VEC2_EXISTS" ]; then
+    if [ -z "$WHISPER_EXISTS" ] || [ -z "$WAV2VEC2_EXISTS" ] || [ -z "$WHISPERX_EXISTS" ]; then
         echo "Downloading models from Hugging Face..."
         cd /app && python model_downloader.py
     else
@@ -20,4 +22,15 @@ if [ -n "${HF_TOKEN:-}" ]; then
 fi
 
 echo "Starting server on 0.0.0.0:8000..."
+
+# CUDA diagnostics
+python3 -c "
+import torch
+if torch.cuda.is_available():
+    print(f'[GPU] CUDA OK — {torch.version.cuda}, device: {torch.cuda.get_device_name(0)}')
+else:
+    print('[GPU] WARNING: CUDA not available — models will run on CPU')
+    print('[GPU] Ensure torch was installed with CUDA support (see Dockerfile)')
+"
+
 exec uvicorn colab_server:app --host 0.0.0.0 --port 8000 --log-level info
