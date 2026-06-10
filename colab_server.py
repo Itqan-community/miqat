@@ -16,7 +16,7 @@ app = FastAPI(title="Miqat Colab Alignment Server")
 # Allow browser direct uploads (bypass local proxy for large audio files)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://itqan.dev", "https://miqat-frontend.pages.dev"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
